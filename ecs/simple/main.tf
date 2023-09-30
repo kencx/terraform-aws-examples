@@ -44,7 +44,7 @@ module "vpc" {
 module "ecs_cluster" {
   source = "terraform-aws-modules/ecs/aws//modules/cluster"
 
-  cluster_name                = "sample"
+  cluster_name                = var.cluster_name
   create_cloudwatch_log_group = true
 
   # map of fargate capacity provider definitions
@@ -63,7 +63,7 @@ module "ecs_cluster" {
 module "ecs_service" {
   source = "terraform-aws-modules/ecs/aws//modules/service"
 
-  name        = "sample"
+  name        = var.service_name
   cluster_arn = module.ecs_cluster.arn
 
   cpu    = 1024
@@ -79,16 +79,16 @@ module "ecs_service" {
   # desired_count = 1
 
   container_definitions = {
-    whoami = {
-      image     = "traefik/whoami"
+    (var.container_name) = {
+      image     = var.container_image
       cpu       = 512
       memory    = 1024
       essential = true
       port_mappings = [
         {
-          name          = "whoami"
-          containerPort = 80
-          hostPort      = 80
+          name          = var.container_name
+          containerPort = var.container_port
+          hostPort      = var.container_port
           protocol      = "tcp"
         }
       ]
@@ -103,8 +103,8 @@ module "ecs_service" {
 
   load_balancer = {
     service = {
-      container_name   = "whoami"
-      container_port   = 80
+      container_name   = var.container_name
+      container_port   = var.container_port
       target_group_arn = element(module.alb.target_group_arns, 0)
     }
   }
@@ -114,8 +114,8 @@ module "ecs_service" {
   security_group_rules = {
     alb_ingress = {
       type                     = "ingress"
-      from_port                = 80
-      to_port                  = 80
+      from_port                = var.container_port
+      to_port                  = var.container_port
       protocol                 = "tcp"
       source_security_group_id = module.alb_sg.security_group_id
     }
@@ -132,7 +132,7 @@ module "ecs_service" {
 module "alb_sg" {
   source = "terraform-aws-modules/security-group/aws"
 
-  name   = "sample-service"
+  name   = "${var.service_name}-service"
   vpc_id = module.vpc.vpc_id
 
   ingress_rules       = ["http-80-tcp"]
@@ -160,7 +160,7 @@ module "alb" {
 
   target_groups = [
     {
-      name             = "sample-whoami"
+      name             = "${var.service_name}-${var.container_name}"
       backend_protocol = "HTTP"
       backend_port     = 80
       target_type      = "ip"
