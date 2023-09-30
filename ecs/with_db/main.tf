@@ -16,10 +16,36 @@ provider "aws" {
 locals {
   vpc_cidr = "10.0.0.0/16"
   azs      = slice(data.aws_availability_zones.available.names, 0, 3)
+
+  cluster_name = "sample"
+
+  container_name  = "miniflux"
+  container_image = "miniflux/miniflux:2.0.36"
+  container_port  = 8120
+
+  db_name     = "${local.container_name}-postgres"
+  db_username = local.container_name
+  db_port     = 5432
+  db_password = "miniflux"
+  db_url      = "postgres://${local.db_username}:${local.db_password}@${module.db.db_instance_endpoint}/${local.container_name}?sslmode=disable"
+
+  admin_username = "admin"
+  admin_pass     = "admin123"
+}
+
+data "aws_ssm_parameter" "container_image" {
+  name = "/${local.container_name}/container_image"
+}
+
+data "aws_secretsmanager_secret" "db_url" {
+  arn = aws_secretsmanager_secret.db_url.arn
+}
+
+data "aws_secretsmanager_secret" "admin" {
+  arn = aws_secretsmanager_secret.admin.arn
 }
 
 data "aws_availability_zones" "available" {}
-
 
 module "vpc" {
   # https://github.com/terraform-aws-modules/terraform-aws-vpc/tree/master
@@ -47,7 +73,7 @@ module "vpc" {
 module "ecs_cluster" {
   source = "terraform-aws-modules/ecs/aws//modules/cluster"
 
-  cluster_name                = "sample"
+  cluster_name                = local.cluster_name
   create_cloudwatch_log_group = true
 
   # map of fargate capacity provider definitions
@@ -63,14 +89,10 @@ module "ecs_cluster" {
   }
 }
 
-locals {
-  database_url = "postgres://miniflux:miniflux@${module.db.db_instance_endpoint}/miniflux?sslmode=disable"
-}
-
 module "ecs_service" {
   source = "terraform-aws-modules/ecs/aws//modules/service"
 
-  name        = "sample"
+  name        = local.cluster_name
   cluster_arn = module.ecs_cluster.arn
 
   cpu    = 1024
@@ -85,25 +107,47 @@ module "ecs_service" {
   # https://github.com/terraform-aws-modules/terraform-aws-ecs/blob/master/docs/README.md#service-1
   # desired_count = 1
 
+  task_exec_ssm_param_arns = [aws_ssm_parameter.container_image.arn]
+  task_exec_secret_arns = [
+    data.aws_secretsmanager_secret.db_url.arn,
+    data.aws_secretsmanager_secret.admin.arn,
+  ]
+
   container_definitions = {
-    miniflux = {
-      image     = "miniflux/miniflux:2.0.36"
+    (local.container_name) = {
+      image     = data.aws_ssm_parameter.container_image.value
       cpu       = 1024
       memory    = 2048
       essential = true
       port_mappings = [
         # container and host port must be the same
         {
-          name          = "miniflux"
-          containerPort = 8120
-          hostPort      = 8120
+          name          = local.container_name
+          containerPort = local.container_port
+          hostPort      = local.container_port
           protocol      = "tcp"
         }
       ]
+
+      secrets = [
+        {
+          name      = "DATABASE_URL"
+          valueFrom = data.aws_secretsmanager_secret.db_url.arn
+        },
+        {
+          name      = "ADMIN_USERNAME"
+          valueFrom = "${data.aws_secretsmanager_secret.admin.arn}:username::"
+        },
+        {
+          name      = "ADMIN_PASSWORD"
+          valueFrom = "${data.aws_secretsmanager_secret.admin.arn}:password::"
+        }
+      ]
+
       environment = [
         {
           name  = "PORT"
-          value = 8120
+          value = local.container_port
         },
         {
           name  = "DEBUG"
@@ -121,18 +165,6 @@ module "ecs_service" {
           name  = "CREATE_ADMIN"
           value = 1
         },
-        {
-          name  = "ADMIN_USERNAME"
-          value = "admin"
-        },
-        {
-          name  = "ADMIN_PASSWORD"
-          value = "admin123"
-        },
-        {
-          name  = "DATABASE_URL"
-          value = local.database_url
-        },
       ]
 
       readonly_root_filesystem = false
@@ -145,8 +177,8 @@ module "ecs_service" {
 
   load_balancer = {
     service = {
-      container_name   = "miniflux"
-      container_port   = 8120
+      container_name   = local.container_name
+      container_port   = local.container_port
       target_group_arn = element(module.alb.target_group_arns, 0)
     }
   }
@@ -156,15 +188,15 @@ module "ecs_service" {
   security_group_rules = {
     alb_ingress = {
       type                     = "ingress"
-      from_port                = 8120
-      to_port                  = 8120
+      from_port                = local.container_port
+      to_port                  = local.container_port
       protocol                 = "tcp"
       source_security_group_id = module.alb_sg.security_group_id
     }
     db_ingress = {
       type                     = "ingress"
-      from_port                = 5432
-      to_port                  = 5432
+      from_port                = local.db_port
+      to_port                  = local.db_port
       protocol                 = "tcp"
       source_security_group_id = module.db_sg.security_group_id
     }
@@ -181,20 +213,11 @@ module "ecs_service" {
 module "alb_sg" {
   source = "terraform-aws-modules/security-group/aws"
 
-  name   = "sample-service"
+  name   = "${local.cluster_name}-service"
   vpc_id = module.vpc.vpc_id
 
-  # ingress_rules       = ["http-80-tcp"]
-  # ingress_cidr_blocks = ["0.0.0.0/0"]
-
-  ingress_with_cidr_blocks = [
-    {
-      from_port   = 8120
-      to_port     = 8120
-      protocol    = "tcp"
-      cidr_blocks = "0.0.0.0/0"
-    }
-  ]
+  ingress_rules       = ["http-80-tcp"]
+  ingress_cidr_blocks = ["0.0.0.0/0"]
 
   egress_rules       = ["all-all"]
   egress_cidr_blocks = module.vpc.private_subnets_cidr_blocks
@@ -216,10 +239,9 @@ module "alb" {
     },
   ]
 
-  # https://github.com/terraform-aws-modules/terraform-aws-alb
   target_groups = [
     {
-      name             = "sample-miniflux"
+      name             = "${local.cluster_name}-${local.container_name}"
       backend_protocol = "HTTP"
       backend_port     = 80
       target_type      = "ip"
@@ -227,24 +249,35 @@ module "alb" {
   ]
 }
 
+module "db_sg" {
+  source = "terraform-aws-modules/security-group/aws"
+
+  name   = local.db_name
+  vpc_id = module.vpc.vpc_id
+
+  ingress_rules       = ["postgresql-tcp"]
+  ingress_cidr_blocks = module.vpc.private_subnets_cidr_blocks
+}
+
 module "db" {
   source = "terraform-aws-modules/rds/aws"
 
-  identifier = "miniflux-postgres"
+  identifier = local.db_name
 
   engine               = "postgres"
   engine_version       = "14"
   family               = "postgres14"
   major_engine_version = "14"
-  instance_class       = "db.t4g.large"
+  instance_class       = "db.t3.micro"
 
+  # in GB
   allocated_storage     = 10
   max_allocated_storage = 25
 
-  db_name  = "miniflux"
-  username = "miniflux"
-  password = "miniflux"
-  port     = 5432
+  db_name  = local.container_name
+  username = local.db_username
+  password = local.db_password
+  port     = local.db_port
 
   # manage master password in SSM not supported with replicas
   manage_master_user_password = false
@@ -253,13 +286,13 @@ module "db" {
   db_subnet_group_name   = module.vpc.database_subnet_group
   vpc_security_group_ids = [module.db_sg.security_group_id]
 
-  enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"]
+  enabled_cloudwatch_logs_exports = ["postgresql"]
   create_cloudwatch_log_group     = true
 
   # backups required in order to create a replica
-  backup_retention_period = 1
-  skip_final_snapshot     = true
-  deletion_protection     = false
+  # backup_retention_period = 0
+  # skip_final_snapshot     = true
+  # deletion_protection     = false
 
   parameters = [
     {
@@ -271,14 +304,4 @@ module "db" {
       value = "utf8"
     }
   ]
-}
-
-module "db_sg" {
-  source = "terraform-aws-modules/security-group/aws"
-
-  name   = "miniflux-postgres"
-  vpc_id = module.vpc.vpc_id
-
-  ingress_rules       = ["postgresql-tcp"]
-  ingress_cidr_blocks = [module.vpc.vpc_cidr_block]
 }
